@@ -1,11 +1,9 @@
 import React, { useState, useRef, useEffect } from 'react';
 
 // Gerekli kütüphaneleri projenize dahil etmeniz gerekmektedir.
-// Bu örnekte, CDN üzerinden script'leri dinamik olarak yüklüyoruz.
 const XLSX_CDN = 'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js';
 const TAILWIND_CDN = 'https://cdn.tailwindcss.com';
-// Hata veren CDN adresi yerine cdnjs adresi ile değiştirildi.
-const HTML5_QRCODE_CDN = 'https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.8/html5-qrcode.min.js';
+const TESSERACT_CDN = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.0.4/dist/tesseract.min.js';
 
 // Yardımcı Fonksiyon: Script'leri yüklemek için
 const loadScript = (src) => {
@@ -132,280 +130,365 @@ const mrzSpecialistParser = (rawOcrText) => {
         surname: nameParts[0]?.replace(/<+$/, ''),
         given_names: nameParts[1]?.replace(/<+$/, ''),
         document_number: docNum,
+        document_number_check: docNumCheck,
         nationality: line2.substring(10, 13),
-        date_of_birth: formatYYMMDD(dob),
+        date_of_birth: dob,
+        date_of_birth_check: dobCheck,
         sex: line2.substring(20, 21),
-        date_of_expiry: formatYYMMDD(expiry),
-        optional_data: optionalData.replace(/<+$/, ''),
+        date_of_expiry: expiry,
+        date_of_expiry_check: expiryCheck,
+        optional_data: optionalData,
+        formatted_dob: formatYYMMDD(dob),
+        formatted_expiry: formatYYMMDD(expiry)
     };
-
-    const docNumComputed = calculateCheckDigit(docNum);
-    const dobComputed = calculateCheckDigit(dob);
-    const expiryComputed = calculateCheckDigit(expiry);
 
     const checks = {
-        document_number: { found: docNumCheck, computed: docNumComputed.toString(), valid: docNumCheck === docNumComputed.toString() },
-        dob: { found: dobCheck, computed: dobComputed.toString(), valid: dobCheck === dobComputed.toString() },
-        expiry: { found: expiryCheck, computed: expiryComputed.toString(), valid: expiryCheck === expiryComputed.toString() },
+        docNumCheck: calculateCheckDigit(docNum) === parseInt(docNumCheck, 10),
+        dobCheck: calculateCheckDigit(dob) === parseInt(dobCheck, 10),
+        expiryCheck: calculateCheckDigit(expiry) === parseInt(expiryCheck, 10),
+        optionalDataCheck: calculateCheckDigit(optionalData) === parseInt(line2.substring(28, 29), 10),
+        compositeCheck: calculateCheckDigit(line2.substring(0, 10) + dob + expiry + optionalData) === parseInt(line2.substring(29, 30), 10)
     };
-
-    const allChecksValid = checks.document_number.valid && checks.dob.valid && checks.expiry.valid;
 
     return {
         mrz_lines: canonicalLines,
-        parsed,
+        status: Object.values(checks).every(c => c) ? 'VALID' : 'CHECK_FAILED',
         checks,
         substitutions,
-        status: allChecksValid ? 'OK' : 'CHECKSUM_FAILURE',
+        parsed
     };
 };
 
-const DeveloperCredit = () => {
+const CameraScanner = ({ onDataExtracted, onClose }) => {
+    const videoRef = useRef(null);
+    const canvasRef = useRef(null);
+    const [cameraActive, setCameraActive] = useState(false);
+    const [scanning, setScanning] = useState(false);
+    const streamRef = useRef(null);
+    const [ocrLoaded, setOcrLoaded] = useState(false);
+    const [recognizing, setRecognizing] = useState(false);
+    const [statusMessage, setStatusMessage] = useState('Kamera açılıyor...');
+
+    useEffect(() => {
+        const loadOCR = async () => {
+            try {
+                if (typeof Tesseract !== 'undefined') {
+                    setOcrLoaded(true);
+                    setStatusMessage('OCR hazır. Kamerayı başlatıyorum...');
+                } else {
+                    setStatusMessage('Tesseract yükleniyor...');
+                }
+            } catch (err) {
+                setStatusMessage('OCR yükleme hatası: ' + err.message);
+            }
+        };
+
+        loadOCR();
+        startCamera();
+
+        return () => {
+            stopCamera();
+        };
+    }, []);
+
+    const startCamera = async () => {
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: {
+                    facingMode: 'environment',
+                    width: { ideal: 1280 },
+                    height: { ideal: 720 }
+                }
+            });
+            streamRef.current = stream;
+            if (videoRef.current) {
+                videoRef.current.srcObject = stream;
+                videoRef.current.play();
+                setCameraActive(true);
+                setStatusMessage('Kimlik kartının MRZ bölümünü görüntüye alın');
+            }
+        } catch (err) {
+            setStatusMessage('Kamera erişim hatası: ' + err.message);
+        }
+    };
+
+    const stopCamera = () => {
+        if (streamRef.current) {
+            streamRef.current.getTracks().forEach(track => track.stop());
+            setCameraActive(false);
+        }
+    };
+
+    const captureAndProcess = async () => {
+        if (!videoRef.current || !canvasRef.current || recognizing) return;
+        
+        setRecognizing(true);
+        setStatusMessage('MRZ metni çıkartılıyor...');
+
+        try {
+            const context = canvasRef.current.getContext('2d');
+            canvasRef.current.width = videoRef.current.videoWidth;
+            canvasRef.current.height = videoRef.current.videoHeight;
+            context.drawImage(videoRef.current, 0, 0);
+            
+            const imageData = canvasRef.current.toDataURL('image/jpeg');
+
+            // Tesseract OCR kullanarak metin çıkarma
+            if (typeof Tesseract !== 'undefined') {
+                const result = await Tesseract.recognize(imageData, 'tur+eng');
+                const extractedText = result.data.text;
+                
+                setStatusMessage('MRZ analiz ediliyor...');
+                const mrzResult = mrzSpecialistParser(extractedText);
+
+                if (mrzResult.status === 'VALID' && mrzResult.parsed.document_number) {
+                    // TCKN kimlik numarasından çıkar (ek 15 haneden sonrası)
+                    const tckn = mrzResult.parsed.optional_data?.substring(0, 11) || '';
+                    
+                    // Doğum tarihi formatını dönüştür (YYMMDD -> GG.AA.YYYY)
+                    const dobYYMMDD = mrzResult.parsed.date_of_birth;
+                    let dobFormatted = '';
+                    if (dobYYMMDD && dobYYMMDD.length === 6) {
+                        const yy = dobYYMMDD.substring(0, 2);
+                        const mm = dobYYMMDD.substring(2, 4);
+                        const dd = dobYYMMDD.substring(4, 6);
+                        
+                        let year = parseInt(yy, 10);
+                        const currentYearYY = new Date().getFullYear() % 100;
+                        year += (year > currentYearYY + 5) ? 1900 : 2000;
+                        
+                        dobFormatted = `${dd}.${mm}.${year}`;
+                    }
+
+                    if (validateTCKN(tckn)) {
+                        onDataExtracted({
+                            tckn,
+                            dob: dobFormatted
+                        });
+                        setStatusMessage('Başarıyla okundu!');
+                        setTimeout(() => onClose(), 1500);
+                    } else {
+                        setStatusMessage('Geçerli TCKN bulunamadı. Tekrar deneyin.');
+                    }
+                } else {
+                    setStatusMessage('MRZ formatı tanınamadı. Kartı düzgün konumlandırın.');
+                }
+            }
+        } catch (error) {
+            setStatusMessage('OCR hatası: ' + error.message);
+        } finally {
+            setRecognizing(false);
+        }
+    };
+
     return (
-        <a
-            href="https://www.ismailkaraca.com.tr/"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="fixed bottom-4 right-4 z-50 flex items-center gap-3 rounded-lg bg-white px-4 py-2 text-xs text-gray-700 shadow-lg transition-shadow hover:shadow-xl"
-        >
-            <img
-                src="https://www.ismailkaraca.com.tr/wp-content/uploads/2025/03/ismail1002025.svg"
-                alt="İsmail Karaca Logo"
-                className="h-8 w-8 rounded-full"
-                onError={(e) => { e.target.onerror = null; e.target.src='https://placehold.co/32x32/eeeeee/333333?text=IK'; }}
-            />
-            <span className="font-medium hidden sm:inline">
-                Geliştirici: İsmail Karaca | Geri bildirim için tıklayın.
-            </span>
-            <span className="font-medium sm:hidden">
-                Geliştirici: İsmail Karaca
-            </span>
-        </a>
+        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4">
+            <div className="bg-white rounded-lg max-w-2xl w-full">
+                <div className="p-4 bg-indigo-600 text-white flex justify-between items-center rounded-t-lg">
+                    <h2 className="text-xl font-bold">Kamera ile MRZ Okuma</h2>
+                    <button onClick={onClose} className="text-2xl font-bold leading-none hover:opacity-70">&times;</button>
+                </div>
+                
+                <div className="p-6">
+                    <div className="mb-4 text-center text-sm text-gray-600 bg-blue-50 p-3 rounded">
+                        <p className="font-semibold">Talimat:</p>
+                        <p>Kimlik kartının arkasındaki MRZ (Machine Readable Zone) bölümünü kamera görüntüsüne alın</p>
+                    </div>
+
+                    <div className="relative bg-black rounded-lg overflow-hidden mb-4" style={{ aspectRatio: '4/3' }}>
+                        {cameraActive && (
+                            <>
+                                <video ref={videoRef} className="w-full h-full object-cover" />
+                                <div className="absolute inset-0 border-4 border-green-500 opacity-50"></div>
+                            </>
+                        )}
+                        {!cameraActive && (
+                            <div className="w-full h-full flex items-center justify-center text-white">
+                                Kamera aktif değil
+                            </div>
+                        )}
+                    </div>
+                    <canvas ref={canvasRef} className="hidden" />
+
+                    <div className="text-center mb-4 text-sm text-gray-700 bg-gray-50 p-3 rounded">
+                        <p>{statusMessage}</p>
+                    </div>
+
+                    <div className="flex gap-3">
+                        <button
+                            onClick={captureAndProcess}
+                            disabled={!cameraActive || recognizing}
+                            className="flex-1 p-3 bg-green-500 text-white font-semibold rounded-lg hover:bg-green-600 disabled:bg-gray-400 transition-colors"
+                        >
+                            {recognizing ? 'İşleniyor...' : 'Fotoğraf Çek & Oku'}
+                        </button>
+                        <button
+                            onClick={onClose}
+                            className="flex-1 p-3 bg-gray-400 text-white font-semibold rounded-lg hover:bg-gray-500 transition-colors"
+                        >
+                            İptal Et
+                        </button>
+                    </div>
+
+                    <div className="mt-4 p-3 bg-yellow-50 border border-yellow-200 rounded text-xs text-yellow-800">
+                        <p className="font-semibold mb-1">Başarılı okuma için:</p>
+                        <ul className="list-disc list-inside space-y-1">
+                            <li>Kartın arkasını kameraya doğru tutun</li>
+                            <li>MRZ bölümü (2 satır metin) görüntüde net olmalı</li>
+                            <li>İyi aydınlatma koşulları kullanın</li>
+                            <li>Kartı düz tutun, eğik konumlandırmayın</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </div>
     );
 };
 
-// Ana uygulama bileşeni
-export default function App() {
-  const [scannedData, setScannedData] = useState([]);
-  const [error, setError] = useState('');
+const DeveloperCredit = () => (
+    <footer className="mt-8 text-center text-gray-500 text-xs">
+        <p>Kimlik Bilgisi Okuma ve Aktarma Uygulaması | Kamera & MRZ Okuma Özelliği Eklenmiş</p>
+    </footer>
+);
+
+const App = () => {
   const [libsLoaded, setLibsLoaded] = useState(false);
   const [manualTckn, setManualTckn] = useState('');
   const [manualDob, setManualDob] = useState('');
   const [manualTel, setManualTel] = useState('');
   const [manualVeliTel, setManualVeliTel] = useState('');
+  const [scannerInput, setScannerInput] = useState('');
+  const [scannedData, setScannedData] = useState([]);
+  const [error, setError] = useState('');
   const [tcknError, setTcknError] = useState('');
   const [dobError, setDobError] = useState('');
   const [isVeliTelRequired, setIsVeliTelRequired] = useState(false);
-  const [scannerInput, setScannerInput] = useState('');
-  const [isScannerOpen, setIsScannerOpen] = useState(false);
-  const [cameraError, setCameraError] = useState('');
-
+  const [showCameraScanner, setShowCameraScanner] = useState(false);
+  
+  const scannerInputRef = useRef(null);
   const dobInputRef = useRef(null);
   const datePickerRef = useRef(null);
-  const scannerInputRef = useRef(null);
   const telInputRef = useRef(null);
   const veliTelInputRef = useRef(null);
-  const html5QrCodeRef = useRef(null);
 
   useEffect(() => {
-    Promise.all([loadScript(XLSX_CDN), loadScript(TAILWIND_CDN), loadScript(HTML5_QRCODE_CDN)])
-    .then(() => {
+    const loadLibs = async () => {
+      try {
+        await loadScript(TAILWIND_CDN);
+        await loadScript(XLSX_CDN);
+        await loadScript(TESSERACT_CDN);
         setLibsLoaded(true);
-    })
-    .catch(err => {
-        console.error(err);
-        setError('Gerekli kütüphaneler yüklenemedi. İnternet bağlantınızı kontrol edin.');
-    });
+      } catch (err) {
+        setError('Kütüphaneler yüklenemedi: ' + err.message);
+      }
+    };
+    loadLibs();
   }, []);
 
-  const parseBarcode = (text) => {
-    let tckn = null, dob = null;
-    // TCKN: 11 haneli, 0 ile başlamayan sayı
-    const tcknMatch = text.match(/\b([1-9][0-9]{10})\b/);
-    if (tcknMatch) tckn = tcknMatch[1];
-    
-    // DOB: GG.AA.YYYY veya GGAA YYYY formatlarını arayabiliriz
-    // Bu regex GG.AA.YYYY, GG/AA/YYYY, GG-AA-YYYY, G GAA YYYY, G.G.AAAA vb. yakalamaya çalışır
-    // Daha spesifik bir regex: (GG.AA.YYYY)
-    let dobMatch = text.match(/(0[1-9]|[12][0-9]|3[01])\.(0[1-9]|1[0-2])\.((19|20)\d{2})\b/);
-    if (dobMatch) {
-      dob = `${dobMatch[1]}.${dobMatch[2]}.${dobMatch[3]}`;
-    } else {
-      // Alternatif format (GGMMYYYY)
-      dobMatch = text.match(/\b(0[1-9]|[12][0-9]|3[01])(0[1-9]|1[0-2])((19|20)\d{2})\b/);
-      if (dobMatch && !tcknMatch) { // Eğer TCKN bulunamadıysa, bu 11 haneli bir TCKN olabilir
-          // Bu basit kontrol, TCKN'nin yanlışlıkla tarih olarak alınmasını engellemeye çalışır
-          // Daha karmaşık bir mantık gerekebilir.
-          if(text.length > 20) { // Genellikle barkod verisi daha uzundur
-             dob = `${dobMatch[1]}.${dobMatch[2]}.${dobMatch[3]}`;
-          }
-      } else if (dobMatch && tcknMatch && dobMatch[0] !== tcknMatch[0]) {
-           dob = `${dobMatch[1]}.${dobMatch[2]}.${dobMatch[3]}`;
-      }
-    }
-
-    return (tckn && dob) ? { TCKN: tckn, DogumTarihi: dob } : null;
-  };
-  
-  const handleScanResult = (result) => {
-    if (result && result.status === 'OK') {
-        // MRZ'den gelen tarihi GG.AA.YYYY formatına çevir
-        let dob = result.parsed.date_of_birth; // YYYY-MM-DD
-        if (dob && /^\d{4}-\d{2}-\d{2}$/.test(dob)) {
-            const parts = dob.split('-');
-            dob = `${parts[2]}.${parts[1]}.${parts[0]}`;
-        }
-
-        const newData = { 
-            TCKN: result.parsed.document_number.replace(/<+$/, ''), 
-            DogumTarihi: dob 
-        };
-
-        if (!scannedData.some(item => item.TCKN === newData.TCKN)) {
-            // setScannedData(prev => [...prev, newData]); // Veriyi listeye hemen ekleme
-            setManualTckn(newData.TCKN);
-            updateDob(newData.DogumTarihi);
-            telInputRef.current?.focus();
-        } else {
-            setError('Bu kimlik daha önce eklendi.');
-        }
-    } else if (result && result.status === 'CHECKSUM_FAILURE') {
-        setError('MRZ okundu fakat doğrulanamadı. Lütfen tekrar deneyin.');
-    } else {
-        setError('MRZ formatı geçersiz veya okuma hatası çok.');
-    }
-  };
-  
-  const processScannerInput = (text) => {
-    if (!text || !text.trim()) return;
-    setError(''); setTcknError('');
-    
-    // 1. MRZ Olarak İşlemeyi Dene
-    const mrzResult = mrzSpecialistParser(text);
-    if (mrzResult.status === 'OK' || mrzResult.status === 'CHECKSUM_FAILURE') {
-        handleScanResult(mrzResult);
-        setScannerInput(''); 
-        return;
-    }
-
-    // 2. Barkod Olarak İşlemeyi Dene (TCKN ve DOB içeren)
-    const barcodeResult = parseBarcode(text);
-    if (barcodeResult) {
-        if (!scannedData.some(item => item.TCKN === barcodeResult.TCKN)) {
-            // setScannedData(prev => [...prev, barcodeResult]); // Veriyi listeye hemen ekleme
-            setManualTckn(barcodeResult.TCKN);
-            updateDob(barcodeResult.DogumTarihi);
-            telInputRef.current?.focus();
-        } else { 
-            setError('Bu kimlik daha önce eklendi.'); 
-        }
-        setScannerInput(''); 
-        return;
-    }
-
-    // 3. Sadece TCKN Olarak İşlemeyi Dene
-    const cleanedText = text.trim();
-    if (validateTCKN(cleanedText)) {
-        setManualTckn(cleanedText);
-        setManualDob('');
-        dobInputRef.current?.focus();
-        setScannerInput(''); 
-        return;
-    }
-
-    // 4. Başarısız
-    setError('Okunan veri anlaşılamadı veya eksik bilgi içeriyor. (MRZ, Barkod veya TCKN formatı bulunamadı)');
+  const handleCameraData = (data) => {
+    if (data.tckn) setManualTckn(data.tckn);
+    if (data.dob) setManualDob(data.dob);
+    setShowCameraScanner(false);
+    telInputRef.current?.focus();
   };
 
-  const handleScannerInputKeydown = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) { 
-        e.preventDefault(); 
-        processScannerInput(e.target.value); 
-    }
+  const handleExternalScannerClick = () => {
+    scannerInputRef.current?.focus();
+    setScannerInput('');
   };
 
-  const handleManualAdd = () => {
-    setError(''); setTcknError(''); setDobError('');
-    if (scannedData.some(item => item.TCKN === manualTckn)) { 
-        setError('Bu kimlik daha önce eklendi.'); 
-        return; 
-    }
-    const newData = { TCKN: manualTckn, DogumTarihi: manualDob, Telefon: manualTel };
-    if (isVeliTelRequired) newData.VeliTelefon = manualVeliTel;
-    
-    setScannedData(prev => [...prev, newData]);
-    
-    // Formu temizle
-    setManualTckn(''); 
-    setManualDob(''); 
-    setManualVeliTel(''); 
-    setManualTel(''); 
-    setIsVeliTelRequired(false);
-    setTcknError('');
-    setDobError('');
-    scannerInputRef.current?.focus(); // Bir sonraki tarama için okuyucuya odaklan
-  };
-  
-  const handleExternalScannerClick = () => scannerInputRef.current?.focus();
-  
   const handleTcknChange = (e) => {
-      const value = e.target.value.replace(/\D/g, '');
-      setManualTckn(value);
-      setError(''); setTcknError('');
-      if (value.length === 11) {
-          if (validateTCKN(value)) {
-              dobInputRef.current.focus();
-          } else {
-              setTcknError('TC yanlıştır lütfen kontrol ediniz');
-          }
-      }
-  };
-
-  const handleDobFocus = () => {
-    // Mobil cihazlarda gereksiz takvim açılmasını engelle
-    if (dobInputRef.current && /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent)) {
-       // dobInputRef.current.blur(); // Odağı hemen kaldır
-       // Mobil cihazlarda da manuel girişe izin ver, takvimi zorlama
-    } else if (datePickerRef.current && !manualDob) {
-       // Masaüstünde takvimi açmayı dene
-       try {
-           // datePickerRef.current.showPicker(); // Otomatik açma bazen can sıkıcı olabilir, kapatalım.
-           console.log("Tarih alanı odaklandı, masaüstü.");
-       } catch (e) {
-           // showPicker() her tarayıcıda desteklenmeyebilir
-           console.log("showPicker() desteklenmiyor.");
-       }
-    }
-  };
-
-  const updateDob = (dobString) => {
-    setManualDob(dobString);
-    setDobError('');
-    setIsVeliTelRequired(false);
-    if (dobString.length === 10) {
-        const validation = validateAndCheckAge(dobString);
-        if (!validation.isValid) {
-            setDobError(validation.error);
-        }
-        else {
-          setIsVeliTelRequired(validation.isUnder18);
-          telInputRef.current?.focus();
-        }
+    const value = e.target.value.replace(/\D/g, '');
+    setManualTckn(value);
+    if (value.length === 11 && !validateTCKN(value)) {
+      setTcknError('Geçersiz TCKN!');
+    } else {
+      setTcknError('');
     }
   };
 
   const handleDobChange = (e) => {
-      let value = e.target.value.replace(/[^\d]/g, '');
-      if (value.length > 2) value = `${value.substring(0, 2)}.${value.substring(2)}`;
-      if (value.length > 5) value = `${value.substring(0, 5)}.${value.substring(5, 9)}`;
-      updateDob(value.substring(0, 10)); // Maksimum 10 karakter (GG.AA.YYYY)
+    let value = e.target.value.replace(/\D/g, '');
+    if (value.length >= 2) value = value.substring(0, 2) + '.' + value.substring(2);
+    if (value.length >= 5) value = value.substring(0, 5) + '.' + value.substring(5, 9);
+    setManualDob(value);
+
+    if (value.length === 10) {
+      const validation = validateAndCheckAge(value);
+      if (!validation.isValid) {
+        setDobError(validation.error);
+      } else {
+        setDobError('');
+        setIsVeliTelRequired(validation.isUnder18);
+      }
+    } else {
+      setDobError('');
+      setIsVeliTelRequired(false);
+    }
   };
 
   const handleDateSelect = (e) => {
-      if (e.target.value) {
-          const [year, month, day] = e.target.value.split('-');
-          updateDob(`${day}.${month}.${year}`);
+    const date = new Date(e.target.value);
+    const day = String(date.getDate()).padStart(2, '0');
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const year = date.getFullYear();
+    const formattedDate = `${day}.${month}.${year}`;
+    setManualDob(formattedDate);
+    dobInputRef.current?.focus();
+  };
+
+  const handleDobFocus = () => {
+    datePickerRef.current?.click();
+  };
+
+  const handleScannerInputKeydown = (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const mrzData = scannerInput.trim();
+      if (mrzData) {
+        const mrzResult = mrzSpecialistParser(mrzData);
+        if (mrzResult.parsed && mrzResult.parsed.document_number) {
+          const tckn = mrzResult.parsed.optional_data?.substring(0, 11) || '';
+          if (validateTCKN(tckn)) {
+            setManualTckn(tckn);
+            if (mrzResult.parsed.formatted_dob) {
+              const [year, month, day] = mrzResult.parsed.formatted_dob.split('-');
+              setManualDob(`${day}.${month}.${year}`);
+            }
+            setScannerInput('');
+            telInputRef.current?.focus();
+          }
+        }
       }
+    }
+  };
+
+  const handleManualAdd = () => {
+    setError('');
+    if (!isTcknValid) { setError('TCKN geçersiz.'); return; }
+    if (!isDobValid) { setError('Doğum tarihi geçersiz.'); return; }
+    if (isVeliTelRequired && !isVeliTelValid) { setError('Veli telefonu gerekli.'); return; }
+    if (!isVeliTelRequired && !isTelValid) { setError('Telefon numarası geçersiz.'); return; }
+
+    const existingData = scannedData.find(item => item.TCKN === manualTckn);
+    if (existingData) { setError('Bu TCKN zaten eklenmiş.'); return; }
+
+    const newData = {
+      TCKN: manualTckn,
+      DogumTarihi: manualDob,
+      Telefon: !isVeliTelRequired ? manualTel : '',
+      VeliTelefon: isVeliTelRequired ? manualVeliTel : ''
+    };
+
+    setScannedData([...scannedData, newData]);
+    setManualTckn('');
+    setManualDob('');
+    setManualTel('');
+    setManualVeliTel('');
+    setIsVeliTelRequired(false);
+    setTcknError('');
+    setDobError('');
+    scannerInputRef.current?.focus();
   };
 
   const handleTelChange = (e) => {
@@ -418,11 +501,7 @@ export default function App() {
     if (value.length > 3) formatted += `) ${value.substring(3, 6)}`;
     if (value.length > 6) formatted += ` ${value.substring(6, 8)}`;
     if (value.length > 8) formatted += ` ${value.substring(8, 10)}`;
-    setManualTel(formatted.substring(0, 15)); // Maksimum 15 karakter
-
-    if (formatted.length === 15 && isVeliTelRequired) {
-      veliTelInputRef.current?.focus();
-    }
+    setManualTel(formatted);
   };
 
   const handleVeliTelChange = (e) => {
@@ -435,7 +514,7 @@ export default function App() {
     if (value.length > 3) formatted += `) ${value.substring(3, 6)}`;
     if (value.length > 6) formatted += ` ${value.substring(6, 8)}`;
     if (value.length > 8) formatted += ` ${value.substring(8, 10)}`;
-    setManualVeliTel(formatted.substring(0, 15)); // Maksimum 15 karakter
+    setManualVeliTel(formatted);
   };
 
   const handleDobKeyDown = (e) => {
@@ -465,129 +544,8 @@ export default function App() {
     }
   };
 
-  // --- YENİ FONKSİYONLAR: Kamera Tarayıcı ---
-  const startScanner = async () => {
-    if (!window.Html5Qrcode) {
-        setError('Kamera tarayıcı kütüphanesi yüklenemedi. Lütfen sayfayı yenileyin.');
-        return;
-    }
-    
-    // Tarayıcı zaten açıksa tekrar açma
-    if (isScannerOpen || html5QrCodeRef.current) {
-        return;
-    }
-
-    setIsScannerOpen(true);
-    setCameraError('');
-
-    try {
-        const devices = await Html5Qrcode.getCameras();
-        if (devices && devices.length) {
-            // Arka kamerayı bulmaya çalış
-            let cameraId = devices[0].id; // Varsayılan olarak ilk kamera
-            const backCamera = devices.find(device => 
-                device.label.toLowerCase().includes('back') || 
-                device.label.toLowerCase().includes('arka')
-            );
-            if (backCamera) {
-                cameraId = backCamera.id;
-            }
-            
-            // "reader" ID'li element DOM'a eklendikten sonra başlat
-            setTimeout(() => {
-                try {
-                    const html5QrCode = new Html5Qrcode("reader");
-                    html5QrCodeRef.current = html5QrCode;
-                    
-                    html5QrCode.start(
-                        cameraId, 
-                        {
-                            fps: 10,    // Saniyedeki kare sayısı
-                            qrbox: (viewfinderWidth, viewfinderHeight) => {
-                                // Tarama kutusunu ayarla (daha geniş, daha az yüksek)
-                                const minEdge = Math.min(viewfinderWidth, viewfinderHeight);
-                                const boxSize = Math.floor(minEdge * 0.7);
-                                return { width: boxSize * 1.5, height: boxSize * 0.8 }; // Barkod için daha uygun
-                            }
-                        },
-                        (decodedText, decodedResult) => {
-                            // --- Tarama Başarılı ---
-                            console.log(`Okunan kod = ${decodedText}`, decodedResult);
-                            
-                            // Başarılı okumada titret
-                            if (navigator.vibrate) {
-                                navigator.vibrate(200);
-                            }
-                            
-                            // Mevcut process fonksiyonunu kullanarak veriyi işle
-                            processScannerInput(decodedText);
-                            
-                            // Tarayıcıyı durdur
-                            stopScanner();
-                        },
-                        (errorMessage) => {
-                            // --- Tarama Hatası (sürekli ateşlenir) ---
-                            // console.warn(`Kod tarama hatası = ${errorMessage}`);
-                        }
-                    ).catch(err => {
-                         console.error("Kamera .start() hatası:", err);
-                         setCameraError("Kamera başlatılamadı. " + err.message);
-                         setIsScannerOpen(false);
-                    });
-                } catch (e) {
-                     console.error("Html5Qrcode başlatma hatası:", e);
-                     setCameraError("Kamera tarayıcı nesnesi oluşturulamadı. " + e.message);
-                     setIsScannerOpen(false);
-                }
-            }, 100); // DOM'un güncellenmesi için kısa bir gecikme
-
-        } else {
-            setCameraError('Kamera bulunamadı. Lütfen tarayıcı ayarlarından kamera izni verdiğinizden emin olun.');
-            setIsScannerOpen(false);
-        }
-    } catch (err) {
-        console.error("Kamera alınamadı (getCameras):", err);
-        let userMessage = 'Kamera listesi alınamadı. ';
-        if (err.name === "NotAllowedError" || err.message.includes("Permission denied")) {
-            userMessage += 'Lütfen sayfa için kamera izinlerini kontrol edin.';
-        } else {
-            userMessage += err.message;
-        }
-        setCameraError(userMessage);
-        setIsScannerOpen(false); // Başlatma başarısız olursa modalı kapat
-    }
-  };
-
-  const stopScanner = () => {
-    if (html5QrCodeRef.current) {
-        try {
-             // Sadece 'SCANNING' durumundaysa durdurmayı dene
-            if (html5QrCodeRef.current.getState() === 2) { // 2 = SCANNING
-                html5QrCodeRef.current.stop().then(() => {
-                    console.log("Tarayıcı durduruldu.");
-                }).catch(err => {
-                    console.error("Tarayıcı düzgün durdurulamadı.", err);
-                });
-            }
-        } catch(e) {
-            console.error("Tarayıcı durdurulurken hata:", e);
-        } finally {
-            html5QrCodeRef.current = null;
-            setIsScannerOpen(false);
-        }
-    } else {
-        setIsScannerOpen(false); // Zaten kapalıysa state'i güncelle
-    }
-  };
-  // --- YENİ FONKSİYONLAR SONU ---
-
-
   const exportToExcel = () => {
     if (scannedData.length === 0) { setError('Dışa aktarılacak veri bulunmuyor.'); return; }
-    if (typeof window.XLSX === 'undefined') {
-        setError('Excel kütüphanesi yüklenemedi. Lütfen sayfayı yenileyin.');
-        return;
-    }
     const dataForExport = scannedData.map(item => ({
         'T.C. Kimlik Numarası': item.TCKN,
         'Doğum Tarihi': item.DogumTarihi,
@@ -599,6 +557,7 @@ export default function App() {
     window.XLSX.utils.book_append_sheet(workbook, worksheet, 'Kimlik Bilgileri');
     window.XLSX.writeFile(workbook, 'Kimlik_Bilgileri_Listesi.xlsx');
   };
+
   const handleDelete = (tcknToDelete) => {
     setScannedData(prev => prev.filter(item => item.TCKN !== tcknToDelete));
   };
@@ -607,134 +566,73 @@ export default function App() {
   const isDobValid = /^\d{2}\.\d{2}\.\d{4}$/.test(manualDob) && !dobError;
   const isTelValid = manualTel.length === 15;
   const isVeliTelValid = manualVeliTel.length === 15;
-  
-  // Ekle butonunun aktiflik durumu
-  const isAddButtonDisabled = 
-    !isTcknValid || 
-    !isDobValid || 
-    (isVeliTelRequired && !isVeliTelValid) || // 18 altıysa Veli Tel zorunlu
-    (!isVeliTelRequired && !isTelValid); // 18 üstüyse normal Tel zorunlu
-
+  const isAddButtonDisabled = !isTcknValid || !isDobValid || (isVeliTelRequired && !isVeliTelValid) || (!isVeliTelRequired && !isTelValid);
 
   return (
     <div className="min-h-screen bg-gray-100 text-gray-800 flex flex-col items-center p-4 font-sans">
       <div className="w-full max-w-4xl mx-auto">
         <header className="text-center mb-6">
             <h1 className="text-3xl md:text-4xl font-bold text-indigo-600">Kimlik Bilgisi Okuma ve Aktarma</h1>
-            <p className="text-gray-600 mt-2">Harici MRZ okuyucu kullanarak veya manuel olarak kimlik bilgilerini girin.</p>
+            <p className="text-gray-600 mt-2">Harici MRZ okuyucu, kamera veya manuel olarak kimlik bilgilerini girin.</p>
             <p className="text-orange-600 text-sm mt-2 font-semibold">Tüm işlemler cihazınızda yapılır. Hiçbir veri sunucuya gönderilmez (KVKK Uyumlu).</p>
         </header>
         {!libsLoaded && <div className="text-center p-4 bg-blue-100 text-blue-700 rounded-lg">Kütüphaneler yükleniyor...</div>}
         {libsLoaded && (
         <main className="flex flex-col md:flex-row gap-8">
-          {/* Sol Panel: Veri Girişi */}
           <div className="flex-1 bg-white p-6 rounded-lg shadow-md border border-gray-200">
             <h3 className="text-xl font-semibold mb-4 text-center text-gray-700">Veri Girişi</h3>
             
-            {/* Harici Okuyucu Bölümü */}
-            <div className="mb-6 p-4 bg-gray-50 rounded-lg border border-gray-200">
-              <label className="block text-md font-medium text-gray-700 mb-2">Harici MRZ / Barkod Okuyucu</label>
-              <p className="text-sm text-gray-500 mb-3">Okuyucuyu aktif edin ve kimliği okutun. Veri (MRZ, Barkod veya TCKN) otomatik işlenecektir.</p>
-              <button onClick={handleExternalScannerClick} className="w-full p-3 rounded-md font-semibold bg-indigo-500 text-white hover:bg-indigo-600 transition-colors mb-2">Harici Okuyucuyu Aktif Et</button>
-              
-              {/* --- YENİ BUTON --- */}
+            {/* Kamera Butonu */}
+            <div className="mb-6 p-4 bg-green-50 rounded-lg border border-green-200">
               <button 
-                onClick={startScanner} 
-                disabled={isScannerOpen}
-                className="w-full p-3 rounded-md font-semibold bg-teal-500 text-white hover:bg-teal-600 transition-colors mb-2 flex items-center justify-center gap-2 disabled:bg-gray-400"
+                onClick={() => setShowCameraScanner(true)} 
+                className="w-full p-3 rounded-md font-semibold bg-green-500 text-white hover:bg-green-600 transition-colors flex items-center justify-center gap-2"
               >
-                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" viewBox="0 0 16 16">
-                  <path d="M0 2a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V2zM11.5 1.5a.5.5 0 0 0-.5.5v2a.5.5 0 0 0 .5.5h2a.5.5 0 0 0 .5-.5v-2a.5.5 0 0 0-.5-.5h-2zM2 4a.5.5 0 0 0 .5.5h3a.5.5 0 0 0 0-1h-3A.5.5 0 0 0 2 4zm0 4a.5.5 0 0 0 .5.5h3a.5.5 0 0 0 0-1h-3A.5.5 0 0 0 2 8zm0 4a.5.5 0 0 0 .5.5h3a.5.5 0 0 0 0-1h-3a.5.5 0 0 0-.5.5zm4 0a.5.5 0 0 0 .5.5h3a.5.5 0 0 0 0-1h-3a.5.5 0 0 0-.5.5zm4 0a.5.5 0 0 0 .5.5h3a.5.5 0 0 0 0-1h-3a.5.5 0 0 0-.5.5zm-4-4a.5.5 0 0 0 .5.5h3a.5.5 0 0 0 0-1h-3a.5.5 0 0 0-.5.5zm4 0a.5.5 0 0 0 .5.5h3a.5.5 0 0 0 0-1h-3a.5.5 0 0 0-.5.5zm-4-4a.5.5 0 0 0 .5.5h3a.5.5 0 0 0 0-1h-3a.5.5 0 0 0-.5.5z"/>
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.219A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22a2 2 0 001.664.889H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
                 </svg>
-                Telefon Kamerası ile Tara
+                Kamerada MRZ Oku
               </button>
-              {/* --- YENİ BUTON SONU --- */}
-              
-              <textarea 
-                ref={scannerInputRef} 
-                rows="3" 
-                className="w-full p-2 rounded bg-white border-gray-300 text-gray-900 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 focus:outline-none font-mono" 
-                placeholder="Tarama yapın, veri burada görünecek..." 
-                value={scannerInput} 
-                onChange={(e) => setScannerInput(e.target.value)} 
-                onKeyDown={handleScannerInputKeydown}
-              />
+              <p className="text-sm text-green-700 mt-2 text-center">Hızlı ve doğru okuma için kimlik kartının arkasını tarayın</p>
+            </div>
+
+            <div className="mb-6 p-4 bg-gray-50 rounded-lg border border-gray-200">
+              <label className="block text-md font-medium text-gray-700 mb-2">Harici MRZ Okuyucu Kullanımı</label>
+              <p className="text-sm text-gray-500 mb-3">Okuyucudan gelen veriyi aşağıdaki alana yapıştırın veya okutun. Enter tuşuna basıldığında veri işlenecektir.</p>
+              <button onClick={handleExternalScannerClick} className="w-full p-3 rounded-md font-semibold bg-indigo-500 text-white hover:bg-indigo-600 transition-colors mb-2">Okuyucuyu Aktif Et</button>
+              <textarea ref={scannerInputRef} rows="3" className="w-full p-2 rounded bg-white border-gray-300 text-gray-900 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 focus:outline-none font-mono" placeholder="Tarama yapın, veri burada görünecek..." value={scannerInput} onChange={(e) => setScannerInput(e.target.value)} onKeyDown={handleScannerInputKeydown}/>
             </div>
             
-            {/* Manuel Giriş Bölümü */}
             <div className="flex flex-col gap-4">
               <label className="block text-md font-medium text-gray-700">Veya Bilgileri Elle Girin:</label>
               <div>
-                <input 
-                  type="tel" 
-                  placeholder="T.C. Kimlik Numarası" 
-                  value={manualTckn} 
-                  onChange={handleTcknChange} 
-                  maxLength="11" 
-                  className="w-full p-2 rounded bg-white border border-gray-300 focus:ring-2 focus:ring-indigo-500 focus:outline-none text-gray-900"
-                />
-                <p className="text-gray-500 text-xs mt-1">Hatasız giriş için kimlik arkasındaki barkodu okutmanız önerilir.</p>
+                <input type="text" placeholder="T.C. Kimlik Numarası" value={manualTckn} onChange={handleTcknChange} maxLength="11" className="w-full p-2 rounded bg-white border border-gray-300 focus:ring-2 focus:ring-indigo-500 focus:outline-none text-gray-900"/>
+                <p className="text-gray-500 text-xs mt-1">Doğru giriş için bir barkod okuyucu ile kimliğin arkasındaki barkodun okutulması önerilmektedir.</p>
                 {tcknError && <p className="text-red-600 text-sm mt-1">{tcknError}</p>}
               </div>
                 <div>
                   <div className="relative">
-                    <input 
-                      ref={dobInputRef} 
-                      onFocus={handleDobFocus} 
-                      type="text" 
-                      placeholder="Doğum Tarihi (GG.AA.YYYY)" 
-                      value={manualDob} 
-                      onChange={handleDobChange} 
-                      onKeyDown={handleDobKeyDown} 
-                      maxLength="10" 
-                      className="w-full p-2 rounded bg-white border border-gray-300 focus:ring-2 focus:ring-indigo-500 focus:outline-none text-gray-900 pr-10"
-                    />
+                    <input ref={dobInputRef} onFocus={handleDobFocus} type="text" placeholder="Doğum Tarihi (GG.AA.YYYY)" value={manualDob} onChange={handleDobChange} onKeyDown={handleDobKeyDown} maxLength="10" className="w-full p-2 rounded bg-white border border-gray-300 focus:ring-2 focus:ring-indigo-500 focus:outline-none text-gray-900 pr-10"/>
                     <div className="absolute inset-y-0 right-0 flex items-center px-3 text-gray-500 pointer-events-none">
                         <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M3.5 0a.5.5 0 0 1 .5.5V1h8V.5a.5.5 0 0 1 1 0V1h1a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V3a2 2 0 0 1 2-2h1V.5a.5.5 0 0 1 .5-.5zM1 4v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V4H1z"/></svg>
                     </div>
-                    {/* Gizli tarih seçici */}
-                    <input 
-                      ref={datePickerRef} 
-                      type="date" 
-                      onChange={handleDateSelect} 
-                      className="absolute top-0 left-0 w-full h-full opacity-0 cursor-pointer"
-                      style={{zIndex: -1}} // Ekran okuyucular için erişilebilir ama görünmez
-                      tabIndex={-1} // Tab ile erişilemez yap
-                      aria-hidden="true" // Ekran okuyuculardan gizle (ana input zaten okunuyor)
-                    />
+                    <input ref={datePickerRef} type="date" onChange={handleDateSelect} className="absolute inset-y-0 right-0 w-10 h-full opacity-0 cursor-pointer" aria-label="Tarih seç"/>
                   </div>
                   {dobError && <p className="text-red-600 text-sm mt-1">{dobError}</p>}
                 </div>
                 <div>
-                    <input 
-                      ref={telInputRef} 
-                      type="tel" 
-                      placeholder="Telefon Numarası" 
-                      value={manualTel} 
-                      onChange={handleTelChange} 
-                      onKeyDown={handleTelKeyDown} 
-                      maxLength="15" 
-                      className="w-full p-2 rounded bg-white border border-gray-300 focus:ring-2 focus:ring-indigo-500 focus:outline-none text-gray-900"
-                    />
+                    <input ref={telInputRef} type="text" placeholder="Telefon Numarası" value={manualTel} onChange={handleTelChange} onKeyDown={handleTelKeyDown} maxLength="15" className="w-full p-2 rounded bg-white border border-gray-300 focus:ring-2 focus:ring-indigo-500 focus:outline-none text-gray-900"/>
                     {isVeliTelRequired &&
-                        <p className="text-indigo-600 text-xs mt-1">18 yaşından küçük, telefon numarası isteğe bağlıdır.</p>
+                        <p className="text-indigo-600 text-xs mt-1">18 yaşından küçük olduğu için telefon numarası zorunlu değildir, isteğe bağlı olarak girilebilir.</p>
                     }
-                    <p className="text-gray-500 text-xs mt-1">Numarayı başında '0' olmadan giriniz: (5XX) XXX XX XX</p>
+                    <p className="text-gray-500 text-xs mt-1">Numarayı başında '0' olmadan giriniz.</p>
                 </div>
                 {isVeliTelRequired && (
                     <div>
-                        <input 
-                          ref={veliTelInputRef} 
-                          type="tel" 
-                          placeholder="Veli Telefon Numarası" 
-                          value={manualVeliTel} 
-                          onChange={handleVeliTelChange} 
-                          onKeyDown={handleVeliTelKeyDown} 
-                          maxLength="15" 
-                          className="w-full p-2 rounded bg-white border border-orange-400 focus:ring-2 focus:ring-orange-500 focus:border-orange-500 focus:outline-none text-gray-900"
-                        />
+                        <input ref={veliTelInputRef} type="text" placeholder="Veli Telefon Numarası" value={manualVeliTel} onChange={handleVeliTelChange} onKeyDown={handleVeliTelKeyDown} maxLength="15" className="w-full p-2 rounded bg-white border border-orange-400 focus:ring-2 focus:ring-orange-500 focus:border-orange-500 focus:outline-none text-gray-900"/>
                         <p className="text-orange-600 text-xs mt-1">18 yaşından küçük olduğu için veli telefonu gereklidir.</p>
-                        <p className="text-gray-500 text-xs mt-1">Numarayı başında '0' olmadan giriniz: (5XX) XXX XX XX</p>
+                        <p className="text-gray-500 text-xs mt-1">Numarayı başında '0' olmadan giriniz.</p>
                     </div>
                 )}
                 <button onClick={handleManualAdd} disabled={isAddButtonDisabled} className="p-3 w-full rounded font-semibold transition-colors bg-emerald-500 text-white hover:bg-emerald-600 disabled:bg-gray-300 disabled:cursor-not-allowed">Ekle</button>
@@ -742,81 +640,26 @@ export default function App() {
               </div>
             {error && <p className="text-red-700 mt-4 text-center bg-red-100 border border-red-200 p-2 rounded">{error}</p>}
           </div>
-
-          {/* Sağ Panel: Liste */}
-          <div className="flex-1 bg-white p-6 rounded-lg shadow-md border border-gray-200">
-            <h2 className="text-2xl font-bold mb-4 border-b border-gray-200 pb-2 text-indigo-600">Okunan Kimlik Bilgileri</h2>
-            <div className="max-h-[30rem] overflow-y-auto">
-              {scannedData.length === 0 ? (
-                <p className="text-gray-500 text-center mt-8">Henüz veri yok.</p>
-              ) : (
+          <div className="flex-1 bg-white p-6 rounded-lg shadow-md border border-gray-200"><h2 className="text-2xl font-bold mb-4 border-b border-gray-200 pb-2 text-indigo-600">Okunan Kimlik Bilgileri</h2>
+            <div className="max-h-[30rem] overflow-y-auto">{scannedData.length === 0 ? (<p className="text-gray-500 text-center mt-8">Henüz veri yok.</p>) : (
                 <table className="w-full text-left">
-                  <thead className="sticky top-0 bg-gray-50 z-10">
-                    <tr>
-                      <th className="p-3 text-sm font-semibold text-left text-gray-600 border-b-2 border-gray-200">T.C. Kimlik No</th>
-                      <th className="p-3 text-sm font-semibold text-left text-gray-600 border-b-2 border-gray-200">Doğum Tarihi</th>
-                      <th className="p-3 text-sm font-semibold text-left text-gray-600 border-b-2 border-gray-200">Telefon No</th>
-                      <th className="p-3 text-sm font-semibold text-left text-gray-600 border-b-2 border-gray-200">Veli Telefon No</th>
-                      <th className="p-3 text-sm font-semibold text-left text-gray-600 border-b-2 border-gray-200"></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {scannedData.map((data, index) => (
-                      <tr key={index} className="hover:bg-gray-50">
-                        <td className="p-3 border-b border-gray-200 font-mono text-sm">{data.TCKN}</td>
-                        <td className="p-3 border-b border-gray-200 font-mono text-sm">{data.DogumTarihi}</td>
-                        <td className="p-3 border-b border-gray-200 font-mono text-sm">{data.Telefon || '-'}</td>
-                        <td className="p-3 border-b border-gray-200 font-mono text-sm">{data.VeliTelefon || '-'}</td>
-                        <td className="p-3 border-b border-gray-200 text-right">
-                          <button onClick={() => handleDelete(data.TCKN)} className="text-gray-400 hover:text-red-600 text-xl font-bold leading-none px-2 rounded-full transition-colors">&times;</button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
-            </div>
-            <button onClick={exportToExcel} disabled={scannedData.length === 0} className="w-full mt-4 p-3 rounded-md font-bold text-lg bg-blue-500 text-white hover:bg-blue-600 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors">Excel'e Aktar</button>
+                  <thead className="sticky top-0 bg-gray-50 z-10"><tr><th className="p-3 text-sm font-semibold text-left text-gray-600 border-b-2 border-gray-200">T.C. Kimlik No</th><th className="p-3 text-sm font-semibold text-left text-gray-600 border-b-2 border-gray-200">Doğum Tarihi</th><th className="p-3 text-sm font-semibold text-left text-gray-600 border-b-2 border-gray-200">Telefon No</th><th className="p-3 text-sm font-semibold text-left text-gray-600 border-b-2 border-gray-200">Veli Telefon No</th><th className="p-3 text-sm font-semibold text-left text-gray-600 border-b-2 border-gray-200"></th></tr></thead>
+                  <tbody>{scannedData.map((data, index) => (<tr key={index} className="hover:bg-gray-50"><td className="p-3 border-b border-gray-200 font-mono text-sm">{data.TCKN}</td><td className="p-3 border-b border-gray-200 font-mono text-sm">{data.DogumTarihi}</td><td className="p-3 border-b border-gray-200 font-mono text-sm">{data.Telefon || '-'}</td><td className="p-3 border-b border-gray-200 font-mono text-sm">{data.VeliTelefon || '-'}</td><td className="p-3 border-b border-gray-200 text-right"><button onClick={() => handleDelete(data.TCKN)} className="text-gray-400 hover:text-red-600 text-xl font-bold leading-none px-2 rounded-full transition-colors">&times;</button></td></tr>))}</tbody>
+                </table>)}
+            </div><button onClick={exportToExcel} disabled={scannedData.length === 0} className="w-full mt-4 p-3 rounded-md font-bold text-lg bg-blue-500 text-white hover:bg-blue-600 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors">Excel'e Aktar</button>
           </div>
         </main>)}
+        
+        {showCameraScanner && (
+            <CameraScanner 
+                onDataExtracted={handleCameraData}
+                onClose={() => setShowCameraScanner(false)}
+            />
+        )}
       </div>
-
-      {/* --- YENİ KAMERA MODALI --- */}
-      {isScannerOpen && (
-        <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black bg-opacity-75" aria-modal="true" role="dialog">
-            <div className="bg-white rounded-lg shadow-xl w-full max-w-md mx-4">
-                <div className="p-4 border-b flex justify-between items-center">
-                    <h3 className="text-lg font-semibold text-gray-800">Kamera Tarayıcı</h3>
-                    <button onClick={stopScanner} className="text-gray-400 hover:text-gray-600 text-2xl">&times;</button>
-                </div>
-                <div className="p-4">
-                    <div id="reader" className="w-full rounded-md overflow-hidden bg-gray-200 aspect-video">
-                        {/* Tarayıcı videosu buraya eklenecek */}
-                    </div>
-                    {cameraError && (
-                        <div className="mt-4 p-3 bg-red-100 text-red-700 rounded-md text-sm" role="alert">
-                            <strong>Hata:</strong> {cameraError}
-                        </div>
-                    )}
-                    <p className="text-gray-600 text-sm mt-4 text-center">
-                        Lütfen kimliğinizin <strong>arkasındaki barkodu</strong> tarayıcı alanına hizalayın.
-                    </p>
-                </div>
-                <div className="p-4 bg-gray-50 border-t rounded-b-lg text-right">
-                    <button 
-                        onClick={stopScanner} 
-                        className="px-4 py-2 rounded-md font-semibold bg-gray-200 text-gray-700 hover:bg-gray-300 transition-colors"
-                    >
-                        Kapat
-                    </button>
-                </div>
-            </div>
-        </div>
-      )}
-      {/* --- YENİ KAMERA MODALI SONU --- */}
-
       <DeveloperCredit />
     </div>
   );
 }
 
+export default App;
