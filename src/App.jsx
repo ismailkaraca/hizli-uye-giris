@@ -184,31 +184,72 @@ const CameraScanner = ({ onDataExtracted, onClose }) => {
         };
 
         loadOCR();
-        startCamera();
+        
+        // Biraz gecikmeyle kamera başlat
+        const timer = setTimeout(() => {
+            startCamera();
+        }, 500);
 
         return () => {
+            clearTimeout(timer);
             stopCamera();
         };
     }, []);
 
     const startCamera = async () => {
         try {
-            const stream = await navigator.mediaDevices.getUserMedia({
+            // Kamera izni kontrol et
+            const constraints = {
                 video: {
-                    facingMode: 'environment',
+                    facingMode: { ideal: 'environment' },
                     width: { ideal: 1280 },
                     height: { ideal: 720 }
                 }
-            });
+            };
+
+            // Önce environment kamerası dene, başarısız olursa herhangi bir kamerayı kullan
+            let stream;
+            try {
+                stream = await navigator.mediaDevices.getUserMedia(constraints);
+            } catch (envErr) {
+                console.log('Environment kamerası başarısız, alternatif deniyor...');
+                // Fallback: Tüm kameralar arasından bir tane seç
+                stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: true,
+                    audio: false 
+                });
+            }
+
             streamRef.current = stream;
             if (videoRef.current) {
                 videoRef.current.srcObject = stream;
-                videoRef.current.play();
+                
+                // Video play işlemini daha iyi yönet
+                videoRef.current.onloadedmetadata = () => {
+                    videoRef.current.play().catch(err => {
+                        console.error('Video play hatası:', err);
+                        setStatusMessage('Video oynatma hatası');
+                    });
+                };
+
                 setCameraActive(true);
                 setStatusMessage('Kimlik kartının MRZ bölümünü görüntüye alın');
             }
         } catch (err) {
-            setStatusMessage('Kamera erişim hatası: ' + err.message);
+            console.error('Kamera hatası:', err);
+            
+            let errorMsg = 'Kamera erişim hatası';
+            if (err.name === 'NotAllowedError') {
+                errorMsg = 'Kamera izni reddedildi. Tarayıcı ayarlarından izin verin.';
+            } else if (err.name === 'NotFoundError') {
+                errorMsg = 'Cihazda kamera bulunamadı.';
+            } else if (err.name === 'NotReadableError') {
+                errorMsg = 'Kamera başka bir uygulama tarafından kullanılıyor.';
+            } else if (err.name === 'SecurityError') {
+                errorMsg = 'HTTPS bağlantısı gerekli. Güvenli bağlantı kullanın.';
+            }
+            
+            setStatusMessage(errorMsg);
         }
     };
 
@@ -298,13 +339,22 @@ const CameraScanner = ({ onDataExtracted, onClose }) => {
                     <div className="relative bg-black rounded-lg overflow-hidden mb-4" style={{ aspectRatio: '4/3' }}>
                         {cameraActive && (
                             <>
-                                <video ref={videoRef} className="w-full h-full object-cover" />
+                                <video 
+                                    ref={videoRef} 
+                                    className="w-full h-full object-cover" 
+                                    autoPlay 
+                                    playsInline
+                                    muted
+                                />
                                 <div className="absolute inset-0 border-4 border-green-500 opacity-50"></div>
                             </>
                         )}
                         {!cameraActive && (
                             <div className="w-full h-full flex items-center justify-center text-white">
-                                Kamera aktif değil
+                                <div className="text-center">
+                                    <div className="text-lg mb-2">🎥</div>
+                                    <p>{statusMessage.includes('hatası') ? statusMessage : 'Kamera başlatılıyor...'}</p>
+                                </div>
                             </div>
                         )}
                     </div>
@@ -322,6 +372,14 @@ const CameraScanner = ({ onDataExtracted, onClose }) => {
                         >
                             {recognizing ? 'İşleniyor...' : 'Fotoğraf Çek & Oku'}
                         </button>
+                        {!cameraActive && (
+                            <button
+                                onClick={() => window.location.reload()}
+                                className="flex-1 p-3 bg-yellow-500 text-white font-semibold rounded-lg hover:bg-yellow-600 transition-colors"
+                            >
+                                Yeniden Dene
+                            </button>
+                        )}
                         <button
                             onClick={onClose}
                             className="flex-1 p-3 bg-gray-400 text-white font-semibold rounded-lg hover:bg-gray-500 transition-colors"
@@ -331,12 +389,12 @@ const CameraScanner = ({ onDataExtracted, onClose }) => {
                     </div>
 
                     <div className="mt-4 p-3 bg-yellow-50 border border-yellow-200 rounded text-xs text-yellow-800">
-                        <p className="font-semibold mb-1">Başarılı okuma için:</p>
+                        <p className="font-semibold mb-2">❗ Kamera sorunları varsa:</p>
                         <ul className="list-disc list-inside space-y-1">
-                            <li>Kartın arkasını kameraya doğru tutun</li>
-                            <li>MRZ bölümü (2 satır metin) görüntüde net olmalı</li>
-                            <li>İyi aydınlatma koşulları kullanın</li>
-                            <li>Kartı düz tutun, eğik konumlandırmayın</li>
+                            <li><strong>İzin:</strong> Tarayıcınızın kamera erişim izni vermesine izin verin</li>
+                            <li><strong>HTTPS:</strong> Uygulamayı HTTPS üzerinden açın</li>
+                            <li><strong>Başka Uygulama:</strong> Başka bir uygulamanın kamerayı kullanıp kullanmadığını kontrol edin</li>
+                            <li><strong>Tarayıcı:</strong> Chrome, Firefox veya Safari kullanmayı deneyin</li>
                         </ul>
                     </div>
                 </div>
