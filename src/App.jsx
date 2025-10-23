@@ -164,53 +164,72 @@ const CameraScanner = ({ onDataExtracted, onClose }) => {
     const canvasRef = useRef(null);
     const fileInputRef = useRef(null);
     const [cameraActive, setCameraActive] = useState(false);
-    const [scanning, setScanning] = useState(false);
-    const streamRef = useRef(null);
+    const [streamRef, setStreamRef] = useState(null);
     const [recognizing, setRecognizing] = useState(false);
     const [statusMessage, setStatusMessage] = useState('Kamera açılıyor...');
     const [showManualInput, setShowManualInput] = useState(false);
     const [manualMrzText, setManualMrzText] = useState('');
+    const [cameraStarted, setCameraStarted] = useState(false);
 
     useEffect(() => {
-        // Kamera başlat
-        startCamera();
+        const timer = setTimeout(() => {
+            if (!cameraStarted && !showManualInput) {
+                startCamera();
+            }
+        }, 100);
 
         return () => {
+            clearTimeout(timer);
             stopCamera();
         };
-    }, []);
+    }, [cameraStarted, showManualInput]);
 
     const startCamera = async () => {
         try {
+            console.log('Kamera başlatılıyor...');
             setStatusMessage('Kamera erişimi isteniyor...');
             
-            const constraints = {
-                video: {
-                    width: { ideal: 1280 },
-                    height: { ideal: 720 }
-                },
-                audio: false
-            };
+            // Basit ve direkt constraints
+            const stream = await navigator.mediaDevices.getUserMedia({ 
+                video: { facingMode: 'environment' },
+                audio: false 
+            });
 
-            const stream = await navigator.mediaDevices.getUserMedia(constraints);
-            streamRef.current = stream;
+            console.log('Kamera stream alındı:', stream);
+            setStreamRef(stream);
 
             if (videoRef.current) {
                 videoRef.current.srcObject = stream;
-                videoRef.current.play();
+                
+                // Video play'i garantilemek için
+                const playPromise = videoRef.current.play();
+                if (playPromise !== undefined) {
+                    playPromise.catch(error => {
+                        console.error('Video play hatası:', error);
+                    });
+                }
+
                 setCameraActive(true);
+                setCameraStarted(true);
                 setStatusMessage('Kimlik kartının MRZ bölümünü görüntüye alın');
             }
         } catch (err) {
-            console.error('Kamera hatası:', err);
-            setStatusMessage('Kamera başlatılamadı. Manuel giriş kullanın.');
-            setShowManualInput(true);
+            console.error('Kamera hatası detaylı:', err.name, err.message);
+            
+            // Hata durumunda manuel moda geç
+            setStatusMessage('Kamera başlatılamadı. Lütfen elle giriş yapın.');
+            setCameraActive(false);
+            
+            // 2 saniye sonra manuel moda geç
+            setTimeout(() => {
+                setShowManualInput(true);
+            }, 2000);
         }
     };
 
     const stopCamera = () => {
-        if (streamRef.current) {
-            streamRef.current.getTracks().forEach(track => track.stop());
+        if (streamRef) {
+            streamRef.getTracks().forEach(track => track.stop());
             setCameraActive(false);
         }
     };
@@ -307,10 +326,45 @@ const CameraScanner = ({ onDataExtracted, onClose }) => {
         }
     };
 
+    const handleImageUpload = async (e) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+
+        setRecognizing(true);
+        setStatusMessage('Resim yükleniyor ve analiz ediliyor...');
+
+        try {
+            const reader = new FileReader();
+            reader.onload = async (event) => {
+                const imageData = event.target?.result;
+                
+                if (typeof Tesseract !== 'undefined' && Tesseract.recognize) {
+                    try {
+                        setStatusMessage('OCR işlemi yapılıyor...');
+                        const result = await Tesseract.recognize(imageData, 'tur+eng');
+                        const extractedText = result.data.text;
+                        processMRZText(extractedText);
+                    } catch (ocrErr) {
+                        console.error('OCR hatası:', ocrErr);
+                        setStatusMessage('OCR başarısız. Metni elle girin.');
+                    }
+                } else {
+                    setStatusMessage('Tesseract hazır değil. Metni elle girin.');
+                }
+                setRecognizing(false);
+            };
+            reader.readAsDataURL(file);
+        } catch (error) {
+            console.error('Dosya hatası:', error);
+            setStatusMessage('Dosya işleme hatası.');
+            setRecognizing(false);
+        }
+    };
+
     return (
         <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4">
-            <div className="bg-white rounded-lg max-w-2xl w-full">
-                <div className="p-4 bg-indigo-600 text-white flex justify-between items-center rounded-t-lg">
+            <div className="bg-white rounded-lg max-w-2xl w-full max-h-[90vh] overflow-y-auto">
+                <div className="p-4 bg-indigo-600 text-white flex justify-between items-center rounded-t-lg sticky top-0">
                     <h2 className="text-xl font-bold">Kamera ile MRZ Okuma</h2>
                     <button onClick={onClose} className="text-2xl font-bold leading-none hover:opacity-70">&times;</button>
                 </div>
@@ -339,7 +393,7 @@ const CameraScanner = ({ onDataExtracted, onClose }) => {
                                 {!cameraActive && (
                                     <div className="w-full h-full flex items-center justify-center text-white">
                                         <div className="text-center">
-                                            <div className="text-4xl mb-2">📷</div>
+                                            <div className="text-5xl mb-2">📷</div>
                                             <p className="text-sm">{statusMessage}</p>
                                         </div>
                                     </div>
@@ -347,39 +401,57 @@ const CameraScanner = ({ onDataExtracted, onClose }) => {
                             </div>
                             <canvas ref={canvasRef} className="hidden" />
 
-                            <div className="text-center mb-4 text-sm text-gray-700 bg-gray-50 p-3 rounded">
-                                <p className="font-semibold">{statusMessage}</p>
+                            <div className="text-center mb-4 text-sm text-gray-700 bg-gray-50 p-3 rounded font-semibold">
+                                {statusMessage}
                             </div>
 
-                            <div className="flex gap-3">
+                            <div className="flex flex-col gap-2 mb-3">
                                 <button
                                     onClick={captureAndProcess}
                                     disabled={!cameraActive || recognizing}
-                                    className="flex-1 p-3 bg-green-500 text-white font-semibold rounded-lg hover:bg-green-600 disabled:bg-gray-400 transition-colors"
+                                    className="w-full p-3 bg-green-500 text-white font-semibold rounded-lg hover:bg-green-600 disabled:bg-gray-400 transition-colors"
                                 >
                                     {recognizing ? '⏳ İşleniyor...' : '📸 Fotoğraf Çek & Oku'}
                                 </button>
-                                <button
-                                    onClick={() => setShowManualInput(true)}
-                                    className="flex-1 p-3 bg-blue-500 text-white font-semibold rounded-lg hover:bg-blue-600 transition-colors"
-                                >
-                                    ✍️ Elle Gir
-                                </button>
+                                
+                                <div className="flex gap-2">
+                                    <input 
+                                        ref={fileInputRef}
+                                        type="file" 
+                                        accept="image/*"
+                                        onChange={handleImageUpload}
+                                        className="hidden"
+                                    />
+                                    <button
+                                        onClick={() => fileInputRef.current?.click()}
+                                        disabled={recognizing}
+                                        className="flex-1 p-3 bg-purple-500 text-white font-semibold rounded-lg hover:bg-purple-600 disabled:bg-gray-400 transition-colors"
+                                    >
+                                        🖼️ Resim Yükle
+                                    </button>
+                                    
+                                    <button
+                                        onClick={() => setShowManualInput(true)}
+                                        className="flex-1 p-3 bg-blue-500 text-white font-semibold rounded-lg hover:bg-blue-600 transition-colors"
+                                    >
+                                        ✍️ Elle Gir
+                                    </button>
+                                </div>
+
                                 <button
                                     onClick={onClose}
-                                    className="flex-1 p-3 bg-gray-400 text-white font-semibold rounded-lg hover:bg-gray-500 transition-colors"
+                                    className="w-full p-3 bg-gray-400 text-white font-semibold rounded-lg hover:bg-gray-500 transition-colors"
                                 >
                                     ✕ İptal Et
                                 </button>
                             </div>
 
-                            <div className="mt-4 p-3 bg-yellow-50 border border-yellow-200 rounded text-xs text-yellow-800">
-                                <p className="font-semibold mb-2">❗ Kamera sorunları varsa:</p>
-                                <ul className="list-disc list-inside space-y-1 text-xs">
-                                    <li>HTTPS bağlantısı kullanın</li>
-                                    <li>Tarayıcı kamera izinlerini kontrol edin</li>
-                                    <li>Başka uygulamadaki kamera kapatsın</li>
-                                    <li>Manuel giriş seçeneğini kullanın</li>
+                            <div className="p-3 bg-yellow-50 border border-yellow-200 rounded text-xs text-yellow-800">
+                                <p className="font-semibold mb-2">❗ Seçenekler:</p>
+                                <ul className="space-y-1 text-xs">
+                                    <li>📸 Canlı kameradan fotoğraf çek</li>
+                                    <li>🖼️ Önceden çekili bir resim yükle</li>
+                                    <li>✍️ MRZ metnini elle yapıştır</li>
                                 </ul>
                             </div>
                         </>
@@ -387,7 +459,7 @@ const CameraScanner = ({ onDataExtracted, onClose }) => {
                         <>
                             <div className="mb-4 text-center text-sm text-gray-600 bg-blue-50 p-3 rounded">
                                 <p className="font-semibold">Manuel MRZ Giriş</p>
-                                <p>Kimlik kartının MRZ bölümünden (iki satır) metni aşağıya kopyalayıp yapıştırın</p>
+                                <p>Kimlik kartının MRZ bölümünden (iki satır) metni aşağıya yapıştırın</p>
                             </div>
 
                             <textarea 
@@ -402,33 +474,35 @@ const CameraScanner = ({ onDataExtracted, onClose }) => {
                                 <p>{statusMessage}</p>
                             </div>
 
-                            <div className="flex gap-3">
+                            <div className="flex flex-col gap-2">
                                 <button
                                     onClick={handleManualMrzSubmit}
                                     disabled={recognizing || !manualMrzText.trim()}
-                                    className="flex-1 p-3 bg-green-500 text-white font-semibold rounded-lg hover:bg-green-600 disabled:bg-gray-400 transition-colors"
+                                    className="w-full p-3 bg-green-500 text-white font-semibold rounded-lg hover:bg-green-600 disabled:bg-gray-400 transition-colors"
                                 >
                                     {recognizing ? '⏳ İşleniyor...' : '✓ Analiz Et'}
                                 </button>
-                                <button
-                                    onClick={() => setShowManualInput(false)}
-                                    className="flex-1 p-3 bg-gray-400 text-white font-semibold rounded-lg hover:bg-gray-500 transition-colors"
-                                >
-                                    ← Geri
-                                </button>
-                                <button
-                                    onClick={onClose}
-                                    className="flex-1 p-3 bg-red-400 text-white font-semibold rounded-lg hover:bg-red-500 transition-colors"
-                                >
-                                    ✕ İptal Et
-                                </button>
+                                
+                                <div className="flex gap-2">
+                                    <button
+                                        onClick={() => setShowManualInput(false)}
+                                        className="flex-1 p-3 bg-gray-400 text-white font-semibold rounded-lg hover:bg-gray-500 transition-colors"
+                                    >
+                                        ← Geri
+                                    </button>
+                                    <button
+                                        onClick={onClose}
+                                        className="flex-1 p-3 bg-red-400 text-white font-semibold rounded-lg hover:bg-red-500 transition-colors"
+                                    >
+                                        ✕ İptal Et
+                                    </button>
+                                </div>
                             </div>
 
                             <div className="mt-4 p-3 bg-blue-50 border border-blue-200 rounded text-xs text-blue-800">
                                 <p className="font-semibold mb-2">ℹ️ MRZ Nedir?</p>
-                                <p>Kimlik kartının arkasında iki satırlık bir metin bloğudur. Örnek:</p>
-                                <code className="block bg-white p-2 rounded mt-2 text-xs">P&lt;TRKABCD123456&lt;0&lt;
-850101M2508312TRK0000000&lt;&lt;00</code>
+                                <p className="mb-2">Kimlik kartının arkasında iki satırlık bir metin bloğudur.</p>
+                                <p className="font-mono text-xs bg-white p-2 rounded">P&lt;TRKABCD123456&lt;0&lt;<br/>850101M2508312TRK0000000&lt;&lt;00</p>
                             </div>
                         </>
                     )}
