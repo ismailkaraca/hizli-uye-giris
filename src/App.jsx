@@ -162,94 +162,49 @@ const mrzSpecialistParser = (rawOcrText) => {
 const CameraScanner = ({ onDataExtracted, onClose }) => {
     const videoRef = useRef(null);
     const canvasRef = useRef(null);
+    const fileInputRef = useRef(null);
     const [cameraActive, setCameraActive] = useState(false);
     const [scanning, setScanning] = useState(false);
     const streamRef = useRef(null);
-    const [ocrLoaded, setOcrLoaded] = useState(false);
     const [recognizing, setRecognizing] = useState(false);
     const [statusMessage, setStatusMessage] = useState('Kamera açılıyor...');
+    const [showManualInput, setShowManualInput] = useState(false);
+    const [manualMrzText, setManualMrzText] = useState('');
 
     useEffect(() => {
-        const loadOCR = async () => {
-            try {
-                if (typeof Tesseract !== 'undefined') {
-                    setOcrLoaded(true);
-                    setStatusMessage('OCR hazır. Kamerayı başlatıyorum...');
-                } else {
-                    setStatusMessage('Tesseract yükleniyor...');
-                }
-            } catch (err) {
-                setStatusMessage('OCR yükleme hatası: ' + err.message);
-            }
-        };
-
-        loadOCR();
-        
-        // Biraz gecikmeyle kamera başlat
-        const timer = setTimeout(() => {
-            startCamera();
-        }, 500);
+        // Kamera başlat
+        startCamera();
 
         return () => {
-            clearTimeout(timer);
             stopCamera();
         };
     }, []);
 
     const startCamera = async () => {
         try {
-            // Kamera izni kontrol et
+            setStatusMessage('Kamera erişimi isteniyor...');
+            
             const constraints = {
                 video: {
-                    facingMode: { ideal: 'environment' },
                     width: { ideal: 1280 },
                     height: { ideal: 720 }
-                }
+                },
+                audio: false
             };
 
-            // Önce environment kamerası dene, başarısız olursa herhangi bir kamerayı kullan
-            let stream;
-            try {
-                stream = await navigator.mediaDevices.getUserMedia(constraints);
-            } catch (envErr) {
-                console.log('Environment kamerası başarısız, alternatif deniyor...');
-                // Fallback: Tüm kameralar arasından bir tane seç
-                stream = await navigator.mediaDevices.getUserMedia({ 
-                    video: true,
-                    audio: false 
-                });
-            }
-
+            const stream = await navigator.mediaDevices.getUserMedia(constraints);
             streamRef.current = stream;
+
             if (videoRef.current) {
                 videoRef.current.srcObject = stream;
-                
-                // Video play işlemini daha iyi yönet
-                videoRef.current.onloadedmetadata = () => {
-                    videoRef.current.play().catch(err => {
-                        console.error('Video play hatası:', err);
-                        setStatusMessage('Video oynatma hatası');
-                    });
-                };
-
+                videoRef.current.play();
                 setCameraActive(true);
                 setStatusMessage('Kimlik kartının MRZ bölümünü görüntüye alın');
             }
         } catch (err) {
             console.error('Kamera hatası:', err);
-            
-            let errorMsg = 'Kamera erişim hatası';
-            if (err.name === 'NotAllowedError') {
-                errorMsg = 'Kamera izni reddedildi. Tarayıcı ayarlarından izin verin.';
-            } else if (err.name === 'NotFoundError') {
-                errorMsg = 'Cihazda kamera bulunamadı.';
-            } else if (err.name === 'NotReadableError') {
-                errorMsg = 'Kamera başka bir uygulama tarafından kullanılıyor.';
-            } else if (err.name === 'SecurityError') {
-                errorMsg = 'HTTPS bağlantısı gerekli. Güvenli bağlantı kullanın.';
-            }
-            
-            setStatusMessage(errorMsg);
+            setStatusMessage('Kamera başlatılamadı. Manuel giriş kullanın.');
+            setShowManualInput(true);
         }
     };
 
@@ -264,7 +219,7 @@ const CameraScanner = ({ onDataExtracted, onClose }) => {
         if (!videoRef.current || !canvasRef.current || recognizing) return;
         
         setRecognizing(true);
-        setStatusMessage('MRZ metni çıkartılıyor...');
+        setStatusMessage('Fotoğraf çekiliyor...');
 
         try {
             const context = canvasRef.current.getContext('2d');
@@ -272,53 +227,83 @@ const CameraScanner = ({ onDataExtracted, onClose }) => {
             canvasRef.current.height = videoRef.current.videoHeight;
             context.drawImage(videoRef.current, 0, 0);
             
+            // Görüntü verilerini al
             const imageData = canvasRef.current.toDataURL('image/jpeg');
-
-            // Tesseract OCR kullanarak metin çıkarma
-            if (typeof Tesseract !== 'undefined') {
-                const result = await Tesseract.recognize(imageData, 'tur+eng');
-                const extractedText = result.data.text;
-                
-                setStatusMessage('MRZ analiz ediliyor...');
-                const mrzResult = mrzSpecialistParser(extractedText);
-
-                if (mrzResult.status === 'VALID' && mrzResult.parsed.document_number) {
-                    // TCKN kimlik numarasından çıkar (ek 15 haneden sonrası)
-                    const tckn = mrzResult.parsed.optional_data?.substring(0, 11) || '';
-                    
-                    // Doğum tarihi formatını dönüştür (YYMMDD -> GG.AA.YYYY)
-                    const dobYYMMDD = mrzResult.parsed.date_of_birth;
-                    let dobFormatted = '';
-                    if (dobYYMMDD && dobYYMMDD.length === 6) {
-                        const yy = dobYYMMDD.substring(0, 2);
-                        const mm = dobYYMMDD.substring(2, 4);
-                        const dd = dobYYMMDD.substring(4, 6);
-                        
-                        let year = parseInt(yy, 10);
-                        const currentYearYY = new Date().getFullYear() % 100;
-                        year += (year > currentYearYY + 5) ? 1900 : 2000;
-                        
-                        dobFormatted = `${dd}.${mm}.${year}`;
-                    }
-
-                    if (validateTCKN(tckn)) {
-                        onDataExtracted({
-                            tckn,
-                            dob: dobFormatted
-                        });
-                        setStatusMessage('Başarıyla okundu!');
-                        setTimeout(() => onClose(), 1500);
-                    } else {
-                        setStatusMessage('Geçerli TCKN bulunamadı. Tekrar deneyin.');
-                    }
-                } else {
-                    setStatusMessage('MRZ formatı tanınamadı. Kartı düzgün konumlandırın.');
+            
+            setStatusMessage('Metin tanınıyor (Tesseract)...');
+            
+            // Tesseract OCR kullanma
+            if (typeof Tesseract !== 'undefined' && Tesseract.recognize) {
+                try {
+                    const result = await Tesseract.recognize(imageData, 'tur+eng');
+                    const extractedText = result.data.text;
+                    processMRZText(extractedText);
+                } catch (ocrErr) {
+                    console.error('OCR hatası:', ocrErr);
+                    setStatusMessage('Tesseract hatası, manuel giriş kullanın.');
+                    setShowManualInput(true);
                 }
+            } else {
+                setStatusMessage('Tesseract yüklenemedi. Manuel giriş kullanın.');
+                setShowManualInput(true);
             }
         } catch (error) {
-            setStatusMessage('OCR hatası: ' + error.message);
+            console.error('İşlem hatası:', error);
+            setStatusMessage('Hata oluştu. Manuel giriş kullanın.');
+            setShowManualInput(true);
         } finally {
             setRecognizing(false);
+        }
+    };
+
+    const processMRZText = (extractedText) => {
+        try {
+            setStatusMessage('MRZ analiz ediliyor...');
+            const mrzResult = mrzSpecialistParser(extractedText);
+
+            if (mrzResult.status === 'VALID' && mrzResult.parsed.document_number) {
+                const tckn = mrzResult.parsed.optional_data?.substring(0, 11) || '';
+                const dobYYMMDD = mrzResult.parsed.date_of_birth;
+                
+                let dobFormatted = '';
+                if (dobYYMMDD && dobYYMMDD.length === 6) {
+                    const yy = dobYYMMDD.substring(0, 2);
+                    const mm = dobYYMMDD.substring(2, 4);
+                    const dd = dobYYMMDD.substring(4, 6);
+                    
+                    let year = parseInt(yy, 10);
+                    const currentYearYY = new Date().getFullYear() % 100;
+                    year += (year > currentYearYY + 5) ? 1900 : 2000;
+                    
+                    dobFormatted = `${dd}.${mm}.${year}`;
+                }
+
+                if (validateTCKN(tckn)) {
+                    onDataExtracted({
+                        tckn,
+                        dob: dobFormatted
+                    });
+                    setStatusMessage('✅ Başarıyla okundu!');
+                    setTimeout(() => onClose(), 1500);
+                } else {
+                    setStatusMessage('❌ Geçerli TCKN bulunamadı. Tekrar deneyin.');
+                }
+            } else {
+                setStatusMessage('❌ MRZ formatı tanınamadı. Manuel giriş kullanın.');
+                setShowManualInput(true);
+            }
+        } catch (error) {
+            console.error('MRZ analiz hatası:', error);
+            setStatusMessage('MRZ analizi başarısız. Manuel giriş kullanın.');
+            setShowManualInput(true);
+        }
+    };
+
+    const handleManualMrzSubmit = () => {
+        if (manualMrzText.trim()) {
+            processMRZText(manualMrzText);
+        } else {
+            setStatusMessage('Lütfen MRZ metnini girin.');
         }
     };
 
@@ -331,72 +316,122 @@ const CameraScanner = ({ onDataExtracted, onClose }) => {
                 </div>
                 
                 <div className="p-6">
-                    <div className="mb-4 text-center text-sm text-gray-600 bg-blue-50 p-3 rounded">
-                        <p className="font-semibold">Talimat:</p>
-                        <p>Kimlik kartının arkasındaki MRZ (Machine Readable Zone) bölümünü kamera görüntüsüne alın</p>
-                    </div>
-
-                    <div className="relative bg-black rounded-lg overflow-hidden mb-4" style={{ aspectRatio: '4/3' }}>
-                        {cameraActive && (
-                            <>
-                                <video 
-                                    ref={videoRef} 
-                                    className="w-full h-full object-cover" 
-                                    autoPlay 
-                                    playsInline
-                                    muted
-                                />
-                                <div className="absolute inset-0 border-4 border-green-500 opacity-50"></div>
-                            </>
-                        )}
-                        {!cameraActive && (
-                            <div className="w-full h-full flex items-center justify-center text-white">
-                                <div className="text-center">
-                                    <div className="text-lg mb-2">🎥</div>
-                                    <p>{statusMessage.includes('hatası') ? statusMessage : 'Kamera başlatılıyor...'}</p>
-                                </div>
+                    {!showManualInput ? (
+                        <>
+                            <div className="mb-4 text-center text-sm text-gray-600 bg-blue-50 p-3 rounded">
+                                <p className="font-semibold">Talimat:</p>
+                                <p>Kimlik kartının arkasındaki MRZ (Machine Readable Zone) bölümünü kamera görüntüsüne alın</p>
                             </div>
-                        )}
-                    </div>
-                    <canvas ref={canvasRef} className="hidden" />
 
-                    <div className="text-center mb-4 text-sm text-gray-700 bg-gray-50 p-3 rounded">
-                        <p>{statusMessage}</p>
-                    </div>
+                            <div className="relative bg-black rounded-lg overflow-hidden mb-4" style={{ aspectRatio: '4/3' }}>
+                                {cameraActive && (
+                                    <>
+                                        <video 
+                                            ref={videoRef} 
+                                            className="w-full h-full object-cover" 
+                                            autoPlay 
+                                            playsInline
+                                            muted
+                                        />
+                                        <div className="absolute inset-0 border-4 border-green-500 opacity-50"></div>
+                                    </>
+                                )}
+                                {!cameraActive && (
+                                    <div className="w-full h-full flex items-center justify-center text-white">
+                                        <div className="text-center">
+                                            <div className="text-4xl mb-2">📷</div>
+                                            <p className="text-sm">{statusMessage}</p>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                            <canvas ref={canvasRef} className="hidden" />
 
-                    <div className="flex gap-3">
-                        <button
-                            onClick={captureAndProcess}
-                            disabled={!cameraActive || recognizing}
-                            className="flex-1 p-3 bg-green-500 text-white font-semibold rounded-lg hover:bg-green-600 disabled:bg-gray-400 transition-colors"
-                        >
-                            {recognizing ? 'İşleniyor...' : 'Fotoğraf Çek & Oku'}
-                        </button>
-                        {!cameraActive && (
-                            <button
-                                onClick={() => window.location.reload()}
-                                className="flex-1 p-3 bg-yellow-500 text-white font-semibold rounded-lg hover:bg-yellow-600 transition-colors"
-                            >
-                                Yeniden Dene
-                            </button>
-                        )}
-                        <button
-                            onClick={onClose}
-                            className="flex-1 p-3 bg-gray-400 text-white font-semibold rounded-lg hover:bg-gray-500 transition-colors"
-                        >
-                            İptal Et
-                        </button>
-                    </div>
+                            <div className="text-center mb-4 text-sm text-gray-700 bg-gray-50 p-3 rounded">
+                                <p className="font-semibold">{statusMessage}</p>
+                            </div>
 
-                    <div className="mt-4 p-3 bg-yellow-50 border border-yellow-200 rounded text-xs text-yellow-800">
-                        <p className="font-semibold mb-2">❗ Kamera sorunları varsa:</p>
-                        <ul className="list-disc list-inside space-y-1">
-                            <li><strong>İzin:</strong> Tarayıcınızın kamera erişim izni vermesine izin verin</li>
-                            <li><strong>HTTPS:</strong> Uygulamayı HTTPS üzerinden açın</li>
-                            <li><strong>Başka Uygulama:</strong> Başka bir uygulamanın kamerayı kullanıp kullanmadığını kontrol edin</li>
-                            <li><strong>Tarayıcı:</strong> Chrome, Firefox veya Safari kullanmayı deneyin</li>
-                        </ul>
-                    </div>
+                            <div className="flex gap-3">
+                                <button
+                                    onClick={captureAndProcess}
+                                    disabled={!cameraActive || recognizing}
+                                    className="flex-1 p-3 bg-green-500 text-white font-semibold rounded-lg hover:bg-green-600 disabled:bg-gray-400 transition-colors"
+                                >
+                                    {recognizing ? '⏳ İşleniyor...' : '📸 Fotoğraf Çek & Oku'}
+                                </button>
+                                <button
+                                    onClick={() => setShowManualInput(true)}
+                                    className="flex-1 p-3 bg-blue-500 text-white font-semibold rounded-lg hover:bg-blue-600 transition-colors"
+                                >
+                                    ✍️ Elle Gir
+                                </button>
+                                <button
+                                    onClick={onClose}
+                                    className="flex-1 p-3 bg-gray-400 text-white font-semibold rounded-lg hover:bg-gray-500 transition-colors"
+                                >
+                                    ✕ İptal Et
+                                </button>
+                            </div>
+
+                            <div className="mt-4 p-3 bg-yellow-50 border border-yellow-200 rounded text-xs text-yellow-800">
+                                <p className="font-semibold mb-2">❗ Kamera sorunları varsa:</p>
+                                <ul className="list-disc list-inside space-y-1 text-xs">
+                                    <li>HTTPS bağlantısı kullanın</li>
+                                    <li>Tarayıcı kamera izinlerini kontrol edin</li>
+                                    <li>Başka uygulamadaki kamera kapatsın</li>
+                                    <li>Manuel giriş seçeneğini kullanın</li>
+                                </ul>
+                            </div>
+                        </>
+                    ) : (
+                        <>
+                            <div className="mb-4 text-center text-sm text-gray-600 bg-blue-50 p-3 rounded">
+                                <p className="font-semibold">Manuel MRZ Giriş</p>
+                                <p>Kimlik kartının MRZ bölümünden (iki satır) metni aşağıya kopyalayıp yapıştırın</p>
+                            </div>
+
+                            <textarea 
+                                value={manualMrzText}
+                                onChange={(e) => setManualMrzText(e.target.value)}
+                                placeholder="MRZ metnini buraya yapıştırın (örneğin: P<TRKXXX...)"
+                                className="w-full p-3 rounded border-2 border-gray-300 focus:border-indigo-500 focus:outline-none font-mono text-sm mb-4"
+                                rows="5"
+                            />
+
+                            <div className="text-center mb-4 text-sm text-gray-700 bg-gray-50 p-3 rounded">
+                                <p>{statusMessage}</p>
+                            </div>
+
+                            <div className="flex gap-3">
+                                <button
+                                    onClick={handleManualMrzSubmit}
+                                    disabled={recognizing || !manualMrzText.trim()}
+                                    className="flex-1 p-3 bg-green-500 text-white font-semibold rounded-lg hover:bg-green-600 disabled:bg-gray-400 transition-colors"
+                                >
+                                    {recognizing ? '⏳ İşleniyor...' : '✓ Analiz Et'}
+                                </button>
+                                <button
+                                    onClick={() => setShowManualInput(false)}
+                                    className="flex-1 p-3 bg-gray-400 text-white font-semibold rounded-lg hover:bg-gray-500 transition-colors"
+                                >
+                                    ← Geri
+                                </button>
+                                <button
+                                    onClick={onClose}
+                                    className="flex-1 p-3 bg-red-400 text-white font-semibold rounded-lg hover:bg-red-500 transition-colors"
+                                >
+                                    ✕ İptal Et
+                                </button>
+                            </div>
+
+                            <div className="mt-4 p-3 bg-blue-50 border border-blue-200 rounded text-xs text-blue-800">
+                                <p className="font-semibold mb-2">ℹ️ MRZ Nedir?</p>
+                                <p>Kimlik kartının arkasında iki satırlık bir metin bloğudur. Örnek:</p>
+                                <code className="block bg-white p-2 rounded mt-2 text-xs">P&lt;TRKABCD123456&lt;0&lt;
+850101M2508312TRK0000000&lt;&lt;00</code>
+                            </div>
+                        </>
+                    )}
                 </div>
             </div>
         </div>
